@@ -70,7 +70,7 @@ func getS3Fake(t *testing.T) (s3iface.S3API, *httptest.Server) {
 	return s3.New(newSession), ts
 }
 
-func uploadFile(t *testing.T, s3 s3iface.S3API, inventoryBucket string, manifestFileName string, destBucket string, keys ...string) {
+func uploadFile(t *testing.T, s3 s3iface.S3API, inventoryBucket string, inventoryFilename string, destBucket string, keys ...string) {
 	objs := make([]InventoryObject, len(keys))
 	for i, k := range keys {
 		objs[i] = InventoryObject{
@@ -92,44 +92,68 @@ func uploadFile(t *testing.T, s3 s3iface.S3API, inventoryBucket string, manifest
 	uploader := s3manager.NewUploaderWithClient(s3)
 	_, err = uploader.Upload(&s3manager.UploadInput{
 		Bucket: aws.String(inventoryBucket),
-		Key:    aws.String(manifestFileName),
+		Key:    aws.String(inventoryFilename),
 		Body:   f,
 	})
-
 	if err != nil {
 		t.Fatal(err)
 	}
 }
 
+func manifest(inventoryBucketName string, inventoryFilenames ...string) *Manifest {
+	inventoryFiles := make([]inventoryFile, len(inventoryFilenames))
+	for i, f := range inventoryFilenames {
+		inventoryFiles[i] = inventoryFile{Key: f}
+	}
+	return &Manifest{
+		URL:             "s3://my-bucket/manifest.json",
+		SourceBucket:    "data-bucket",
+		Files:           inventoryFiles,
+		Format:          "ORC",
+		inventoryBucket: inventoryBucketName,
+	}
+}
+
+var (
+	inventoryFileKeys = map[string][]string{"inventoryFile.orc": {"boo", "loo", "boo", "loo", "boo", "loo"}}
+)
+
 func TestInventoryReader(t *testing.T) {
 	svc, testServer := getS3Fake(t)
 	defer testServer.Close()
 	const inventoryBucketName = "inventory-bucket"
-	manifestFileName := "manifestFile.orc"
 	_, err := svc.CreateBucket(&s3.CreateBucketInput{
 		Bucket: aws.String(inventoryBucketName),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	uploadFile(t, svc, inventoryBucketName, manifestFileName, "data-bucket", "boo")
-	m := &Manifest{
-		URL:             "s3://my-bucket/manifest.json",
-		SourceBucket:    "data-bucket",
-		Files:           []manifestFile{{Key: manifestFileName}},
-		Format:          "ORC",
-		inventoryBucket: inventoryBucketName,
+	testdata := []struct {
+		InventoryFilenames []string
+	}{
+		{InventoryFilenames: []string{"inventoryFile.orc"}},
 	}
-	reader := NewInventoryReader(context.Background(), svc, m, logging.Default())
-	fileReader, err := reader.GetManifestFileReader(manifestFileName)
-	if err != nil {
-		t.Fatal(err)
-	}
-	res := make([]InventoryObject, 5)
-	err = fileReader.Read(&res)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fmt.Println(res)
 
+	for _, test := range testdata {
+		for _, inventoryFilename := range test.InventoryFilenames {
+			uploadFile(t, svc, inventoryBucketName, inventoryFilename, "data-bucket", inventoryFileKeys[inventoryFilename]...)
+		}
+		m := manifest(inventoryBucketName, test.InventoryFilenames...)
+		reader := NewInventoryReader(context.Background(), svc, m, logging.Default())
+		for _, inventoryFilename := range test.InventoryFilenames {
+			fileReader, err := reader.GetInventoryFileReader(inventoryFilename)
+			if err != nil {
+				t.Fatal(err)
+			}
+			res := make([]InventoryObject, 5)
+			err = fileReader.Read(&res)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(inventoryFileKeys[inventoryFilename]) != len(res) {
+				t.Fatalf("read unexpected number of keys from inventory file %s. expected=%d, got=%d", inventoryFilename, len(inventoryFileKeys[inventoryFilename]), len(res))
+			}
+			fmt.Println(res)
+		}
+	}
 }
